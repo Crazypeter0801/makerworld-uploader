@@ -13,11 +13,17 @@
 1. 检查 3mf 是不是切片后保存的、料槽有没有混料、尺寸会不会超床
 2. 网页端上传 3mf，等云端切片校验
 3. 填标题（限 50 字）、分类、标签、许可证、可见性
-4. 传 4:3 和 3:4 两张封面 + 至少 3 张实物图
+4. 传 4:3 和 3:4 封面及实物图（数量以当前页面要求为准）
 5. 写描述（CKEditor，粘 Markdown 不认）
 6. 再走一遍打印配置页
 
 这套东西一次两次还行，批量发就很折磨。本项目把 1 和 6 的一部分交给脚本，3/4/5 全部结构化，交给 JSON spec 驱动。
+
+## 精简用法
+
+给 agent 一个 3MF 和现有实拍照片即可。标题、短描述、标签和 spec 由 agent 起草；仅补问未知的模型来源、许可证等必要信息。封面建议完整主体、干净背景、均匀光线，留白适配横竖裁切。
+
+图片上传逐张处理裁剪、等待预览变化、保存后回读；未确认成功会返回非零状态并保存诊断。已有草稿可续填，避免重复传 3MF。本轮仅用本地模拟页面验证，真实 MakerWorld 登录上传尚需实测。
 
 ## 安装
 
@@ -63,13 +69,13 @@ python3 scripts/preflight.py model.3mf --cover 实拍.jpg
 uv run --with playwright python mw.py upload --spec spec.json
 ```
 
-### 4. 填表单并存草稿
+### 4. 续填已有草稿（首次 upload 已自动填表并保存）
 
 ```bash
 uv run --with playwright python draft_fill.py --draft <id> --spec spec.json
 ```
 
-脚本不会点「发布」。发布是公开且不可撤回的动作，留给人工。
+脚本不会点「发布」。默认交付草稿，发布留给用户操作。
 
 ## spec 长什么样
 
@@ -96,7 +102,7 @@ uv run --with playwright python draft_fill.py --draft <id> --spec spec.json
 |---|---|
 | Cloudflare | `curl` 403；Playwright headless 也被拦；只有真实 Chrome + 有头 + 持久 profile 能过 |
 | 上传入口 | 是 `/zh/my/models/publish`，不是 `/{lang}/@{handle}/upload`（那是列表页） |
-| 可见性 | radio 的 value 是反的：`false` = 公开，`true` = 私有 |
+| 可见性 | radio 的 value 是反的：按可见标签选择，不依赖 true/false |
 | 模型来源 | 「原创/二次创作」必填，不选时点「保存草稿」**静默失败**（无报错、无请求） |
 | 分类 | MUI Autocomplete，必须 `press_sequentially`；`type()` 不触发 |
 | 图片 | 隐藏 input 直接 `set_input_files` 组件不认，必须走 `expect_file_chooser` |

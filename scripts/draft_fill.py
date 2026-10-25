@@ -87,7 +87,8 @@ def md_to_html(md):
             if not in_ul:
                 out.append("<ul>")
                 in_ul = True
-            out.append(f"<li>{inline(re.sub(r'^\s*[-*]\s+', '', line))}</li>")
+            item = re.sub(r'^\s*[-*]\s+', '', line)
+            out.append(f"<li>{inline(item)}</li>")
         else:
             out.append(f"<p>{inline(line)}</p>")
     close_blocks()
@@ -117,35 +118,78 @@ def pick_images(page):
 
 
 def dismiss_dialog(page, timeout=6):
-    """图片上传后会弹 cropper 弹窗，不处理会挡住后续所有点击。"""
-    end = time.time() + timeout
-    while time.time() < end:
-        d = page.evaluate("""() => {
-          const d = [...document.querySelectorAll('.MuiDialog-root')].filter(x => x.offsetParent !== null);
-          if (!d.length) return null;
-          const btns = [...d[0].querySelectorAll('button')]
-            .map(b => (b.innerText || '').trim()).filter(Boolean);
-          return {btns: btns, text: (d[0].innerText || '').slice(0, 80)};
-        }""")
-        if not d:
-            return "无弹窗"
-        pref = ["确认", "确定", "保存", "完成", "应用", "使用", "Crop", "OK", "Done"]
-        for b in d["btns"]:
-            if any(p in b for p in pref):
-                try:
-                    page.locator(".MuiDialog-root button:visible").filter(
-                        has_text=b).last.click(timeout=4000)
-                    time.sleep(1.2)
-                    return f"弹窗已确认「{b}」"
-                except Exception:
-                    pass
+    """Only confirm a visible image cropper; never Escape (it discards the image)."""
+    dialogs = page.locator('[role="dialog"]:visible, .MuiDialog-root:visible')
+    if not dialogs.count():
+        return "无弹窗"
+    dialog = dialogs.last
+    if not dialog.locator('canvas, img, [class*="crop"], [class*="Crop"]').count():
+        raise RuntimeError("未知弹窗；保留现场，请检查后继续")
+    button = dialog.get_by_role("button", name=re.compile(
+        r"^(确认|确定|保存|完成|应用|使用|裁剪|Crop|OK|Done|Save|Confirm)$", re.I))
+    if button.count() != 1:
+        raise RuntimeError("裁剪确认按钮不明确；保留现场")
+    button.click(timeout=timeout * 1000)
+    dialog.wait_for(state="hidden", timeout=timeout * 1000)
+    return "裁剪已确认"
+
+
+def cover_state(page, portrait=False):
+    selector = ".dropzone.appUpload" if portrait else ".dropzone:not(.appUpload)"
+    zone = page.locator(selector).first
+    if not zone.count():
+        return []
+    return zone.evaluate("""el => [...el.querySelectorAll('img'), el,
+      ...el.querySelectorAll('*')].flatMap(e => {
+        if (e.tagName === 'IMG') return e.complete && e.naturalWidth > 0
+          ? [e.currentSrc || e.src] : [];
+        const bg = getComputedStyle(e).backgroundImage;
+        return bg && bg !== 'none' ? [bg] : [];
+      }).filter(s => s && !s.includes('data:image/svg'))""")
+
+
+def upload_image(page, candidates, files, tag, state, timeout=45):
+    """Selection is not success: confirm crop, then require changed preview/count.
+
+    Retry a different click target only BEFORE files have been submitted.
+    Unknown post-submission state must not cause duplicate gallery uploads.
+    """
+    before = state()
+    last = None
+    for loc in candidates:
         try:
-            page.keyboard.press("Escape")
-            time.sleep(0.8)
-            return f"弹窗按 Esc（按钮={d['btns']}）"
-        except Exception:
-            return "弹窗未能关闭"
-    return "等弹窗超时"
+            with page.expect_file_chooser(timeout=2500) as chooser:
+                loc.click(timeout=2000)
+        except Exception as exc:
+            last = exc
+            continue
+        chooser.value.set_files(files)
+        deadline = time.monotonic() + timeout
+        stable_since = None
+        previous = None
+        while time.monotonic() < deadline:
+            if page.locator('[role="dialog"]:visible, .MuiDialog-root:visible').count():
+                dismiss_dialog(page, 10)
+                stable_since = None
+            alerts = page.locator('[role="alert"]:visible').all_text_contents()
+            if any(re.search(r"失败|错误|过大|不支持|failed|error|too large", x, re.I) for x in alerts):
+                raise RuntimeError(f"{tag}: {'; '.join(alerts)}")
+            now = state()
+            changed = (isinstance(now, int) and now >= (before or 0) + len(files)) or (
+                isinstance(now, list) and now and now != before)
+            busy = page.locator('[role="progressbar"]:visible, [aria-busy="true"]:visible').count()
+            if changed and not busy:
+                if now != previous:
+                    stable_since = time.monotonic()
+                elif stable_since is not None and time.monotonic() - stable_since >= 1:
+                    return f"{tag}: 预览已更新（{len(files)} 张，保存后仍需回读）"
+                previous = now
+            else:
+                stable_since = None
+                previous = None
+            page.wait_for_timeout(200)
+        raise RuntimeError(f"{tag}: 已选文件但未确认上传完成；停止重传以免重复，请检查裁剪/网络/预览")
+    raise RuntimeError(f"{tag}: 未打开文件选择器：{last}")
 
 
 def choose_license(page, want):
@@ -180,7 +224,9 @@ def fill_section(page, spec, report, skip_images=False):
         report.append(choose_license(page, spec["license"]))
 
     # 1.5) 模型来源 —— 必填项，不选的话点「保存草稿」会静默什么都不做
-    src = spec.get("source", "原创")
+    src = spec.get("source")
+    if not src:
+        raise ValueError("缺少 source：请根据用户说明填写原创或二次创作")
     ok = page.evaluate("""(want) => {
         const labs = [...document.querySelectorAll('label')]
             .filter(l => (l.innerText || '').trim() === want && l.offsetParent !== null);
@@ -239,13 +285,10 @@ def fill_section(page, spec, report, skip_images=False):
         except Exception as e:
             report.append(f"标签: ❌ {type(e).__name__} {e}")
 
-    # 5) 可见性
-    if spec.get("visibility", "公开") == "公开":
-        try:
-            page.locator('input[type="radio"][value="true"]').last.click(force=True)
-            report.append("可见性: ✅ 公开")
-        except Exception as e:
-            report.append(f"可见性: ❌ {type(e).__name__}")
+    # Select by visible label: numeric radio values have differed across versions.
+    if spec.get("visibility"):
+        page.get_by_label(spec["visibility"], exact=True).check()
+        report.append(f"可见性: {spec['visibility']}")
 
     # 6) 描述（放在图片之前：图片会弹 cropper 挡住编辑器）
     desc = spec.get("description")
@@ -282,55 +325,65 @@ def fill_section(page, spec, report, skip_images=False):
         report.append("图片: 跳过（--skip-images）")
         return
 
-    # 7) 图片
-    # 实测：隐藏 input 直接 set_input_files 组件不认（既不报错也不上传），
-    # 必须点真实可点区域走 file chooser：
-    #   封面 = .dropzone（第 1 个 4:3、第 2 个 3:4）
-    #   实物图 / 模型图片 = 「添加照片」（第 1 个、第 2 个）
-    def upload_via(locators, files, tag):
-        """按候选顺序试，第一个能弹出文件选择器的就赢。
-
-        4:3 封面的 dropzone 直接 click 有时不出 chooser（上面压着透明 label），
-        所以额外准备了「按文案点」和「点内部 input」两种兜底。
-        """
-        if not isinstance(locators, (list, tuple)):
-            locators = [locators]
-        last = ""
-        for i, loc in enumerate(locators):
-            try:
-                with page.expect_file_chooser(timeout=8000) as fc:
-                    loc.click(timeout=5000)
-                fc.value.set_files(files)
-                time.sleep(6)
-                report.append(f"{tag}: ✅ {len(files)} 张" + (f"（候选{i+1}）" if i else ""))
-                return True
-            except Exception as e:
-                last = f"{type(e).__name__} {str(e)[:60]}"
-        report.append(f"{tag}: ❌ {last}")
-        return False
-
+    # Each upload resolves its own cropper before the next control is clicked.
     if spec.get("cover_4x3"):
-        upload_via([page.locator(".dropzone:not(.appUpload):visible").first,
-                    page.get_by_text("4:3 封面", exact=True).first],
-                   [spec["cover_4x3"]], "封面4:3")
+        report.append(upload_image(page, [page.get_by_text("4:3 封面", exact=True).first,
+            page.locator(".dropzone:not(.appUpload):visible").first],
+            [spec["cover_4x3"]], "封面4:3", lambda: cover_state(page)))
     if spec.get("cover_3x4"):
-        upload_via([page.get_by_text("App封面3:4", exact=True).first,
-                    page.locator(".dropzone.appUpload:visible").first,
-                    page.get_by_text("App优先应用3:4的封面", exact=True).first,
-                    page.get_by_text("3 : 4", exact=True).first],
-                   [spec["cover_3x4"]], "封面3:4")
+        report.append(upload_image(page, [page.get_by_text("App封面3:4", exact=True).first,
+            page.locator(".dropzone.appUpload:visible").first],
+            [spec["cover_3x4"]], "封面3:4", lambda: cover_state(page, True)))
+    for key, label, index in (("photos", "实物图", 0), ("model_photos", "模型图片", 1)):
+        files = spec.get(key) or []
+        if not files:
+            continue
+        have = image_count(page, label)
+        if have is None:
+            raise RuntimeError(f"{label}: 找不到计数，先 discover，不盲目上传")
+        if have:
+            raise RuntimeError(f"{label}: 已有 {have} 张；先核对内容，用 --skip-images 保留，或在页面处理后重跑")
+        # Sequential selection avoids stacked multi-image croppers.
+        for file in files:
+            report.append(upload_image(page,
+                [page.get_by_text("添加照片", exact=True).nth(index)],
+                [file], label, lambda: image_count(page, label)))
 
-    shots = spec.get("photos") or []
-    have = image_count(page, "实物图")
-    if shots:
-        if have and have >= len(shots):
-            report.append(f"实物图: 已有 {have} 张，跳过")
-        elif upload_via([page.get_by_text("添加照片", exact=True).nth(0)], shots, "实物图"):
-            report.append(f"实物图计数: {image_count(page, '实物图')}")
 
-    more = spec.get("model_photos") or []
-    if more:
-        upload_via([page.get_by_text("添加照片", exact=True).nth(1)], more, "模型图片")
+def save_and_verify(page, spec, url, report):
+    failed = [step for step in report if '❌' in step]
+    if failed:
+        raise RuntimeError('表单尚未完成：' + '; '.join(failed))
+    dismiss_dialog(page)
+    expected_counts = {label: image_count(page, label) for label in ("实物图", "模型图片")}
+    with page.expect_response(lambda r: r.request.method in ("PUT", "POST")
+                              and "/draft/" in r.url, timeout=20000) as pending:
+        page.get_by_role("button", name="保存草稿", exact=True).click()
+    response = pending.value
+    if not response.ok:
+        raise RuntimeError(f"草稿保存失败 HTTP {response.status}")
+    # HTTP success alone is insufficient. Check the persisted form.
+    page.goto(url, wait_until="domcontentloaded")
+    page.locator('input[name="title"]').wait_for()
+    page.wait_for_timeout(1500)
+    if spec.get("title") and page.locator('input[name="title"]').input_value() != spec["title"][:50]:
+        raise RuntimeError("保存后标题回读不一致")
+    for key, portrait in (("cover_4x3", False), ("cover_3x4", True)):
+        if spec.get(key):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not cover_state(page, portrait):
+                page.wait_for_timeout(200)
+            if not cover_state(page, portrait):
+                raise RuntimeError(f"保存后 {key} 无图片预览")
+    for label, expected in expected_counts.items():
+        if expected is not None and image_count(page, label) != expected:
+            raise RuntimeError(f"保存后{label}数量不一致")
+    if spec.get("description"):
+        got = page.locator('.ck-editor__editable').first.inner_text()
+        plain = re.sub('<[^>]+>', '', md_to_html(spec['description']))
+        if re.sub(r"\s+", "", htmlmod.unescape(plain)) != re.sub(r"\s+", "", got):
+            raise RuntimeError("保存后描述回读不一致")
+    report.append("草稿保存成功；已回读标题、封面预览、图片数量和描述（不代表已发布）")
 
 
 def main():
@@ -359,46 +412,7 @@ def main():
         print("\n".join(report))
 
         if not a.no_save:
-            # 用网络信号判断是否真的保存：点「保存草稿」被遮挡时既不报错也不发请求
-            puts = []
-            s.page.on("request", lambda r: puts.append(r.url)
-                      if r.method == "PUT" and "/draft/" in r.url else None)
-
-            def js_save():
-                return s.page.evaluate("""() => {
-                    const b = [...document.querySelectorAll('button')]
-                        .filter(x => (x.innerText || '').trim() === '保存草稿').pop();
-                    if (!b) return false;
-                    b.scrollIntoView({block: 'center'});
-                    b.click();
-                    return true;
-                }""")
-
-            saved = False
-            for attempt in range(3):
-                report.append("保存前清弹窗: " + dismiss_dialog(s.page, 8))
-                puts.clear()
-                clicked = js_save()
-                for _ in range(8):
-                    time.sleep(1.5)
-                    if puts:
-                        break
-                if puts:
-                    saved = True
-                    report.append(f"保存草稿: ✅（第{attempt+1}次，PUT {puts[0].split('/api')[-1]}）")
-                    break
-                report.append(f"保存第{attempt+1}次无效（没发 PUT 请求）")
-            if not saved:
-                report.append("保存草稿: ❌ 三次都没发出保存请求")
-
-            s.goto(url)
-            time.sleep(6)
-            title_now = s.page.locator('input[name="title"]').input_value()
-            photos_now = image_count(s.page, "实物图")
-            desc_now = s.page.evaluate(
-                "() => { const e=document.querySelector('.ck-editor__editable');"
-                " return e ? e.innerText.replace(/\\s+/g,'').length : 0; }")
-            report.append(f"回读: 标题={title_now!r} 实物图={photos_now} 描述={desc_now}字")
+            save_and_verify(s.page, spec, url, report)
 
         out = os.path.join(os.path.dirname(a.spec), "draft_fill_report.json")
         with open(out, "w", encoding="utf-8") as f:
@@ -408,6 +422,14 @@ def main():
         if a.hold:
             time.sleep(a.hold)
         return 0
+    except Exception as exc:
+        from mw import OUT_DIR, ensure_dirs, save
+        ensure_dirs()
+        s.page.screenshot(path=os.path.join(OUT_DIR, "draft_failure.png"), full_page=True)
+        save("draft_failure.json", {"draft": a.draft, "url": s.page.url,
+                                    "steps": report, "error": str(exc)})
+        print(f"未完成：{exc}", file=sys.stderr)
+        return 3
     finally:
         s.close()
 

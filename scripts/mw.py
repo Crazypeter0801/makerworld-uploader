@@ -69,7 +69,11 @@ def find_input(page, hints):
 
 def find_file_input(page):
     loc = page.locator('input[type="file"]')
-    return loc.first if loc.count() else None
+    matches = [loc.nth(i) for i in range(loc.count())
+               if '.3mf' in (loc.nth(i).get_attribute('accept') or '').lower()]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def dump_form(page):
@@ -226,11 +230,7 @@ def cmd_discover(a):
     try:
         url = a.url
         if url is None:
-            h = s.handle()
-            if not h:
-                s.goto(f"{BASE}/zh")
-                h = s.handle()
-            url = f"{BASE}/zh/@{h}/upload" if h else f"{BASE}/zh"
+            url = f"{BASE}/zh/my/models/publish"
         log(f"打开 {url}")
         r = s.goto(url)
         log(f"HTTP {r.status if r else '?'} | {s.page.title()} | {s.page.url}")
@@ -279,106 +279,43 @@ def cmd_upload(a):
         if not s.logged_in():
             log("❌ 未登录。先跑：mw.py login")
             return 2
-        h = spec.get("handle") or s.handle()
-        url = spec.get("upload_url") or (f"{BASE}/zh/@{h}/upload" if h else None)
-        if not url:
-            log("❌ 拿不到 handle，请在 spec 里写 handle 或 upload_url")
-            return 2
+        url = spec.get("upload_url") or f"{BASE}/zh/my/models/publish"
         log(f"上传页：{url}")
         s.goto(url)
         page = s.page
 
         # 1) 投文件（第一个 file input 就是模型/打印配置投放区）
         files = [os.path.abspath(p) for p in spec.get("files", [])]
+        if not files:
+            raise ValueError("spec.files 不能为空")
         missing = [p for p in files if not os.path.exists(p)]
         if missing:
             log(f"❌ 文件不存在：{missing}")
             return 2
         fi = find_file_input(page)
         if fi is None:
-            report["unresolved"].append("没找到 input[type=file]，页面结构可能变了 → 跑 discover")
+            raise RuntimeError("没找到文件输入框，请 discover 检查打印配置入口")
         else:
             fi.set_input_files(files)
             report["steps"].append(f"投递文件 {len(files)} 个")
             log(f"已投递：{[os.path.basename(p) for p in files]}")
 
-        # 2) 上传 + 平台切片校验要时间
-        deadline = time.time() + a.upload_timeout
-        last = None
-        while time.time() < deadline:
-            time.sleep(4)
-            txt = page.inner_text("body")[:4000]
-            if any(k in txt for k in ("上传成功", "上传完成", "编辑模型", "模型信息", "打印配置",
-                                      "Uploaded", "Upload complete", "Edit model", "Model info",
-                                      "Print profile")):
-                break
-            bad = ("失败", "错误", "Failed", "Error", "invalid")
-            if any(k in txt for k in bad):
-                last = [ln for ln in txt.split("\n") if any(k in ln for k in bad)][:5]
-                break
-        if last:
-            report["unresolved"].append(f"上传/校验报错：{last}")
-            log(f"⚠️ 页面报错：{last}")
-
-        # 3) 基本信息
-        report["steps"].append(_fill(page, ["模型名称", "标题", "name", "title"],
-                                     spec.get("title"), "标题"))
-        report["steps"].append(_fill(page, ["描述", "description", "简介"],
-                                     spec.get("description"), "描述"))
-
-        # 4) 标签
-        for tag in spec.get("tags", []):
-            loc = find_input(page, ["标签", "tag"])
-            if loc:
-                loc.click()
-                loc.type(tag, delay=10)
-                page.keyboard.press("Enter")
-                time.sleep(0.6)
-        if spec.get("tags"):
-            report["steps"].append(f"标签 {len(spec['tags'])} 个已尝试输入")
-
-        # 5) 分类（点击式下拉，按文案模糊命中）
-        cat = spec.get("category")
-        if cat:
-            try:
-                by_text(page, r"选择?分类|分类|Category|Select category", tag="div").click(timeout=4000)
-                time.sleep(0.8)
-                by_text(page, cat).click(timeout=4000)
-                report["steps"].append(f"分类：{cat} ✅")
-            except Exception:
-                report["unresolved"].append(f"分类「{cat}」没点成功，需人工选")
-
-        # 6) 许可证
-        lic = spec.get("license")
-        if lic:
-            try:
-                by_text(page, lic).first.click(timeout=4000)
-                report["steps"].append(f"许可证：{lic} ✅")
-            except Exception:
-                report["unresolved"].append(f"许可证「{lic}」没命中")
+        # Wait for the draft route; static wizard headings are not completion signals.
+        page.wait_for_url(re.compile(r"/my/models/drafts/[^/]+/edit"),
+                          timeout=a.upload_timeout * 1000)
+        report["draft_url"] = page.url
+        report["draft_id"] = page.url.split("/drafts/")[1].split("/")[0]
+        save("upload_report.json", report)  # checkpoint before form filling
+        from draft_fill import fill_section, save_and_verify
+        page.locator('input[name="title"]').wait_for()
+        fill_section(page, spec, report["steps"])
+        save_and_verify(page, spec, report["draft_url"], report["steps"])
 
         # 7) 收尾：默认只存草稿
         ensure_dirs()
         png = os.path.join(OUT_DIR, "upload_final.png")
         page.screenshot(path=png, full_page=True)
         report["screenshot"] = png
-
-        if a.publish and spec.get("publish") is True and a.yes:
-            btn = by_text(page, r"^发布$|发布模型|立即发布|^Publish$|Publish model", tag="button")
-            btn.click()
-            time.sleep(4)
-            report["steps"].append("已点击发布")
-        else:
-            for pat in (r"存为草稿|保存草稿|另存草稿", r"Save as draft|Save Draft|Save"):
-                try:
-                    by_text(page, pat, tag="button").click(timeout=4000)
-                    report["steps"].append(f"点了「{pat}」")
-                    time.sleep(3)
-                    break
-                except Exception:
-                    continue
-            else:
-                report["unresolved"].append("没找到保存/草稿按钮 —— 浏览器已保持打开，请人工确认")
 
         log("\n".join(report["steps"]))
         if report["unresolved"]:
@@ -391,6 +328,13 @@ def cmd_upload(a):
             time.sleep(a.hold)
         save("upload_report.json", report)
         return 0 if not report["unresolved"] else 3
+    except Exception as exc:
+        report["unresolved"].append(str(exc))
+        report["current_url"] = s.page.url
+        save("upload_report.json", report)
+        s.page.screenshot(path=os.path.join(OUT_DIR, "upload_failure.png"), full_page=True)
+        log(f"未完成：{exc}；已有草稿请用 draft_fill.py --draft 续传，勿重复创建")
+        return 3
     finally:
         s.close()
 
@@ -425,8 +369,6 @@ def main():
 
     p = sub.add_parser("upload")
     p.add_argument("--spec", required=True)
-    p.add_argument("--publish", action="store_true", help="真的点发布（需 spec.publish=true 且 --yes）")
-    p.add_argument("--yes", action="store_true")
     p.add_argument("--upload-timeout", type=int, default=180)
     p.add_argument("--hold", type=int, default=0)
     p.add_argument("--har")
