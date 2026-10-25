@@ -1,0 +1,13 @@
+{
+  "_comment": "复制到任意位置改成自己的 spec。publish 保持 false，除非确认要公开发布。files 用绝对路径。",
+  "handle": "your_makerworld_handle",
+  "files": [
+    "/abs/path/to/model.3mf"
+  ],
+  "title": "模型名称（≤100 字符）",
+  "description": "## 关于这个模型\n\n一句话说明它解决什么问题、尺寸多少。\n\n### 打印参数\n- 打印机：<机型> / <喷嘴>\n- 层高：<x.xx> mm\n- 填充：<xx>%\n- 耗材：<材料>\n- 打印板：<板类型>\n- 预计耗材：约 <xx> g\n\n### 后处理\n- <打磨/装配/胶水等建议>\n\n### 注意事项\n- <公差、支撑、缩放建议>\n",
+  "tags": ["标签1", "标签2", "标签3"],
+  "category": "<按平台分类选一个>",
+  "license": "<由用户指定：CC0 / BY / BY-SA / BY-NC / BY-NC-SA / BY-NC-ND>",
+  "publish": false
+}
