@@ -25,6 +25,43 @@ RAW_EXTS = {
 # 打印配置（Bambu Studio 项目）只吃 3mf
 PROFILE_EXTS = {"3mf"}
 
+# Bambu Studio 的耗材温度分组（随 Studio 安装在 Resources/info/filament_info.json，v1.0.0.4）。
+# 云切片报「高低温耗材无法混合打印」= 同一工程同时有 high_temp 与 low_temp 组的耗材。
+# 注意：PETG / PETG-CF / PCTG 属于 low_temp，与 PLA 同组，可以混打。
+FILAMENT_TEMP_GROUPS = {
+    "high_temp_filament": ["ABS", "ASA", "ASA-CF", "PC", "PA", "PA-CF", "PA-GF", "PA6-CF",
+                           "PET-CF", "PPS", "PPS-CF", "PPA-CF", "PPA-GF", "ABS-GF", "ASA-AERO"],
+    "low_temp_filament": ["PLA", "TPU", "TPU-AMS", "PLA-CF", "PLA-AERO", "PVA", "BVOH",
+                          "PCTG", "PETG", "PETG-CF"],
+    "high_low_compatible_filament": ["HIPS", "PE", "PP", "EVA", "PE-CF", "PP-CF", "PP-GF", "PHA"],
+}
+STUDIO_FILAMENT_INFO = [
+    "/Applications/BambuStudio.app/Contents/Resources/info/filament_info.json",
+    os.path.expandvars(r"%ProgramFiles%\Bambu Studio\resources\info\filament_info.json"),
+    "/usr/share/bambu-studio/resources/info/filament_info.json",
+]
+
+
+def temp_groups():
+    """优先读本机 Bambu Studio 的最新分组，读不到用内置副本。"""
+    for p in STUDIO_FILAMENT_INFO:
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if all(k in d for k in FILAMENT_TEMP_GROUPS):
+                return {k: d[k] for k in FILAMENT_TEMP_GROUPS}, p
+        except (OSError, ValueError):
+            continue
+    return FILAMENT_TEMP_GROUPS, "builtin"
+
+
+def temp_group_of(ftype, groups):
+    for g, names in groups.items():
+        if str(ftype).upper() in {n.upper() for n in names}:
+            return g
+    return None
+
+
 # 各机型打印床尺寸（mm），用于判断是否超床 / 离边缘太近触发规避区
 BEDS = {
     "Bambu Lab A1 mini": (180, 180),
@@ -214,24 +251,42 @@ def check(path, cover=None, out=None, expect="profile"):
                 "上传时选错类型会被判为不合规的打印配置")
 
         # —— 料槽类问题（官方 FAQ 里明确会导致「切片验证失败」）——
-        temps = [s["nozzle_temp"] for s in slots if s["nozzle_temp"]]
         types = [s["type"] for s in slots if s["type"]]
-        if len(set(types)) > 1 and temps and max(temps) - min(temps) >= 20:
+        groups, group_src = temp_groups()
+        info["temp_group_source"] = group_src
+        by_group = {}
+        for t in set(types):
+            by_group.setdefault(temp_group_of(t, groups), []).append(t)
+        if by_group.get("high_temp_filament") and by_group.get("low_temp_filament"):
             report["blockers"].append(
-                f"高低温耗材混打：{'/'.join(sorted(set(types)))}（喷嘴温度 {min(temps)}–{max(temps)}℃）。"
-                "官方 FAQ 明确会报「高低温耗材无法混合打印」，云切片验证必然失败 —— "
-                "把料槽清到只剩一种材质再上传")
+                f"高低温耗材混打：高温 {'/'.join(sorted(by_group['high_temp_filament']))} + "
+                f"低温 {'/'.join(sorted(by_group['low_temp_filament']))}。"
+                "官方 FAQ 明确会报「高低温耗材无法混合打印」—— 去掉其中一组再上传")
+        if by_group.get(None):
+            report["warnings"].append(
+                f"耗材类型 {'/'.join(sorted(by_group[None]))} 不在 Bambu 温度分组表里，无法判断能否混打")
+        if len(set(types)) > 1 and not report["blockers"]:
+            report["notes"].append(
+                f"多种材质同盘（{'/'.join(sorted(set(types)))}）：按 Bambu 分组不算高低温混打，"
+                "但层间结合和换料成本仍需确认")
 
         if len(types) > 1 and len(set(types)) == 1:
             report["warnings"].append(
                 f"有 {len(types)} 个料槽但只有一种材质（{'/'.join(sorted(set(types)))}）："
                 "多槽通常是从别的项目继承来的，单色打印建议只留 1 槽，否则打印配置会显示一堆无用槽位")
 
+        # 系统预设都带 @BBL（含 Generic / PolyLite 等第三方品牌的官方预设）；
+        # 用户另存的预设通常没有，或带 "(1)" / "- Copy" 之类后缀
         custom = [s["preset"] for s in slots
-                  if s["preset"] and not str(s["preset"]).startswith("Bambu")]
+                  if s["preset"] and ("@BBL" not in str(s["preset"])
+                                      or re.search(r"\(\d+\)$|copy|副本", str(s["preset"]), re.I))]
         if custom:
             report["warnings"].append(
-                f"检测到非 Bambu 官方耗材预设：{custom[:3]}。官方要求改为 Bambu 预设，否则校验不通过")
+                f"疑似自定义耗材预设：{custom[:3]}。官方要求使用系统预设，否则校验不通过")
+        changed = read_json_from_zip(z, "Metadata/project_settings.config") or {}
+        diff = [x for x in (changed.get("different_settings_to_system") or []) if x]
+        if diff:
+            info["changed_vs_system_preset"] = diff[0].split(";")
 
         if expect == "profile":
             if not info.get("sliced"):
@@ -256,14 +311,20 @@ def check(path, cover=None, out=None, expect="profile"):
                     f"离打印板边缘 {min(margins):.1f}mm，属贴边摆放。若云切片报「超出规避区」，"
                     "把模型往中间挪 3–5mm 或缩小 2% 再上传")
 
-        plh, ph = info.get("plate_layer_height"), info.get("layer_height")
+        # plate_1.json 里记录的是「首层」层高（实测：0.12 层高、0.2 首层切片后这里是 0.2），
+        # 和 initial_layer_print_height 比，不能和 layer_height 比，否则每个首层更厚的工程都会误报
+        plh = info.get("plate_layer_height")
+        ph = (read_json_from_zip(z, "Metadata/project_settings.config") or {}).get(
+            "initial_layer_print_height") or info.get("layer_height")
         if plh and ph and abs(float(plh) - float(ph)) > 1e-6:
             report["warnings"].append(
-                f"plate_1.json 的层高 {plh} 与 project 层高 {ph} 不一致："
+                f"plate_1.json 的首层层高 {float(plh):g} 与 project 首层 {ph} 不一致："
                 "缩略图/预览是按旧参数生成的，建议重新切片后保存再上传")
 
         # 文件名里的版本号（层高/填充）先过一眼：批量导出的文件夹里最容易发错版本
-        m = re.search(r"(?<![\d.])(0\.(?:0[4-9]|[1-3]\d))(?![\d])", os.path.basename(path))
+        m = re.search(r"(?<![\d.])(0\.\d{1,2})(?=[_\-. ]|$)", os.path.basename(path))
+        if m and not 0.04 <= float(m.group(1)) <= 0.4:
+            m = None
         if m and info.get("layer_height"):
             try:
                 if abs(float(m.group(1)) - float(info["layer_height"])) > 1e-6:

@@ -10,7 +10,7 @@
          真实分类是「其他家用模型 / 收纳工具 / 装饰品 …」，没有「家居」这种叫法
 - 标签    input[type=text] 第 4 个            计数 0/100，Enter 分隔
 - 许可证  input[name="license"] 的 MUI Select，选项是英文全名，见 LICENSE_ALIAS
-- 可见性  radio[value="true"] = 公开
+- 可见性  radio 的 value 与含义相反（value="false" 才是公开），只按 label 文本选
 - 封面    单文件 image input，DOM 顺序 = 4:3、3:4
 - 图片    多文件 image input，顺序 = 实物图、模型图片；
          上传后会弹 cropper 弹窗，不确认会一直挡住后面的操作

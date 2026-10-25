@@ -43,8 +43,7 @@ git clone https://github.com/Crazypeter0801/makerworld-uploader.git \
 ### 1. 登录（只需一次）
 
 ```bash
-cd scripts
-uv run --with playwright python mw.py login
+uv run --with playwright python scripts/mw.py login
 ```
 
 会弹出真实 Chrome（headless 会被 Cloudflare 拦，这是实测结论），人工登录后自动收起，profile 长期有效。
@@ -57,22 +56,22 @@ python3 scripts/preflight.py model.3mf --cover 实拍.jpg
 
 纯标准库，不需要 Playwright。检查项：
 
-- 高低温耗材混打（官方 FAQ 明确会判云切片失败的硬错误）
+- 高低温耗材混打（按 Bambu Studio 自带的耗材温度分组判断；PLA 与 PETG/PETG-CF 同属低温组，不算混打）
 - 非 Bambu 官方预设
-- 文件名层高 vs 工程实际层高
+- 文件名层高 vs 工程实际层高；相对系统预设改过哪些参数（`different_settings_to_system`）
 - 打印床尺寸 / 贴边距离（触发「超出规避区」的常见原因）
 - 是否已切片（**不是必须项** —— 平台用云切片验证，这条降级为提示）
 
 ### 3. 上传 3mf，拿草稿 id
 
 ```bash
-uv run --with playwright python mw.py upload --spec spec.json
+uv run --with playwright python scripts/mw.py upload --spec spec.json
 ```
 
 ### 4. 续填已有草稿（首次 upload 已自动填表并保存）
 
 ```bash
-uv run --with playwright python draft_fill.py --draft <id> --spec spec.json
+uv run --with playwright python scripts/draft_fill.py --draft <id> --spec spec.json
 ```
 
 脚本不会点「发布」。默认交付草稿，发布留给用户操作。
@@ -116,8 +115,11 @@ SKILL.md                        技能定义与完整踩坑记录
 scripts/mw.py                   会话管理（login/whoami/discover/upload/shot）
 scripts/draft_fill.py           spec → 草稿表单（含 Markdown 转 HTML）
 scripts/preflight.py            3mf 发布前体检（纯标准库）
+scripts/check_images.py         照片体检（只读，需 Pillow）
 references/publish-checklist.md 官方字段要求与常见报错
+references/image-upload.md      选图与图片上传排错
 references/spec-template.json   发布 spec 模板
+tests/test_upload.py            图片上传状态机的本地模拟测试
 ```
 
 ## 隐私
